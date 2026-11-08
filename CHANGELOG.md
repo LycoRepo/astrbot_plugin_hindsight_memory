@@ -1,5 +1,12 @@
 # 更新日志
 
+## 未发布
+
+### 新增
+
+- 支持陪伴插件（`astrbot_plugin_private_companion` 7.0.7+）的外部记忆 Provider 接口（`companion.external-memory.v1`）：注册后由本插件承接模型侧记忆，陪伴插件主动让位；同时接收它产生的日记、梦境与主动消息，按 `memory_id` 幂等写入。
+- 新增配置「接入陪伴插件」（`companion_provider_enabled`，默认开启）。没装陪伴插件时此项无效果。
+
 ## v0.1.5（2026-10-26）
 
 ### 优化

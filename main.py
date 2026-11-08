@@ -12,6 +12,7 @@ from astrbot.api.star import Context, Star, StarTools
 from astrbot.core.agent.message import TextPart
 
 from .commands import PluginStateStore, build_help_text, run_manual_recall_for_tag_sets
+from .companion_bridge import CompanionMemoryBridge
 from .conversation_context import DEFAULT_CONTEXT_TURNS, recent_turns, short_query_with_context
 from .hindsight_client import HindsightClient, HindsightClientError
 from .memory_ai import (
@@ -58,13 +59,22 @@ class HindsightMemoryPlugin(Star):
         self.salt = self.store.get_or_create_salt()
         self.hindsight_client: HindsightClient | None = None
         self.hindsight_client_signature: tuple[str, str, int] | None = None
+        self.companion_bridge = CompanionMemoryBridge(self)
+
+    async def initialize(self):
+        # 陪伴插件通常已经加载完；注册一次之后由 on_llm_request 兜底重试。
+        await self.companion_bridge.ensure_registered()
 
     async def terminate(self):
+        await self.companion_bridge.disconnect()
         if self.hindsight_client is not None:
             await self.hindsight_client.aclose()
 
     @filter.on_llm_request()
     async def on_llm_request(self, event: AstrMessageEvent, req: ProviderRequest):
+        bridge = getattr(self, "companion_bridge", None)
+        if bridge is not None:
+            await bridge.ensure_registered()
         if not self._base_enabled():
             return
         scopes = self._scopes(event)
