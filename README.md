@@ -146,6 +146,7 @@ Hindsight 仍固定使用原有 recall API 和 `tags_match: all_strict`，本版
 - **记忆归属**：注册时声明 `handles_model_memory=True`。本插件的记忆注入与保存本来就在 AstrBot 的 LLM 钩子里完成，因此由本插件承担模型侧记忆，陪伴插件让自己的内置记忆注入与记忆工具让位，模型只会看到一份记忆叙事。
 - **接收角色记录**：陪伴插件产生的日记、梦境（`kind=persona_life`）和主动消息（`kind=proactive_message`）会写进 Hindsight，按 `memory_id` 幂等，同一条记录重复推送不会写两遍。这类记录落在 `scope:persona` 标签下，不按某个私聊用户召回。
 - **敏感内容**：写入前过一遍和对话保存相同的判定——密码、API Key、私钥这类硬凭据一律不写；邮箱、手机号、身份证号、地址这类个人信息默认也不写，需要时打开「允许保存含个人信息的角色记录」（`companion_retain_personal_sensitive`）。
+- **失败补写**：写进 Hindsight 失败时，记录会先放进本地队列（最多 50 条、保留 24 小时），下一次成功写入时顺带补写，不会直接丢掉。
 - **撤销**：关闭开关、或停用/卸载本插件时会自动注销注册。
 
 需要知道的三件事：
