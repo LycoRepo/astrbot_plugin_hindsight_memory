@@ -13,16 +13,34 @@
 
 召回（``read``）不注册：本插件的召回走 AstrBot 的 LLM 钩子，不走 provider 的 read 回调。
 统计（``summary``）暂不注册：Hindsight Cloud 没有对应的计数接口，接口本身允许省略。
+
+几个刻意的取舍，与接口契约一致：
+
+* 宿主对 ``write`` **不重试也不缓冲**（``memory_push`` 的规矩），所以这里失败即放弃，
+  原始记录仍在陪伴插件自己的库里；补写属于维护工作，不该压在热路径上。
+* 幂等账本按 ``bank + memory_id`` 记账：换 bank 之后同一条记录会重新写一次到新目的地。
+* 崩溃窗口（Hindsight 已接收、账本还没落盘）无法彻底消除——Hindsight 没有幂等键。
+  这里选择"宁可重放一次，也不丢记录"：重放的记录靠 ``memory_id`` 仍可辨认。
+* 关闭某个会话的 ``/hindsight off`` 或对应 scope 开关时，本插件不再为那个会话召回，
+  而陪伴插件已经把记忆让给了本插件——那个会话会暂时没有长期记忆。provider 注册是
+  安装级、拿不到会话 scope，接口没有提供按 scope 让位的办法，README 里已写明。
 """
 
 from __future__ import annotations
 
 from collections.abc import Mapping
+import asyncio
 import json
 import logging
 from pathlib import Path
+import time
 from typing import Any
 
+from .retention_policy import (
+    _bool_config,
+    _has_hard_sensitive_secret,
+    _has_personal_sensitive,
+)
 from .scope import hash_identifier
 
 
@@ -31,12 +49,21 @@ COMPANION_PLUGIN = "astrbot_plugin_private_companion"
 PROVIDER_ID = "astrbot_plugin_hindsight_memory"
 DISPLAY_NAME = "Hindsight Memory"
 WRITTEN_IDS_FILE = "companion_written_ids.json"
-MAX_WRITTEN_IDS = 1000
 ACCEPTED_KINDS = ("persona_life", "proactive_message")
-# 写一条记录要过一趟 Hindsight Cloud；5 秒（接口示例的默认值）在网络稍慢时会超时，
-# 而宿主对超时的写入不重试，所以这里给得宽一些。
-WRITE_TIMEOUT_SECONDS = 10.0
 CONFIG_KEY = "companion_provider_enabled"
+PERSONAL_KEY = "companion_retain_personal_sensitive"
+WARN_INTERVAL_SECONDS = 3600.0
+
+# 幂等账本：按时间保留 30 天，超过 MAX 条再按最旧淘汰。
+MAX_WRITTEN_IDS = 5000
+WRITTEN_ID_TTL_SECONDS = 30 * 24 * 3600
+
+# 回调超时：至少 10 秒，并且比插件自己的 Hindsight 请求超时更宽，否则宿主会先放弃。
+MIN_WRITE_TIMEOUT_SECONDS = 10.0
+TIMEOUT_MARGIN_SECONDS = 2.0
+
+# 并发写同一个 memory_id 时用锁串行化；锁表超过这个规模就整体清空（都是空闲锁）。
+MAX_WRITE_LOCKS = 512
 
 
 def _log_warning(message: str) -> None:
@@ -44,17 +71,20 @@ def _log_warning(message: str) -> None:
     logger.warning(f"Hindsight {message}")
 
 
-def find_companion_api(context: Any) -> Any | None:
+def find_companion_api(context: Any, *, on_reject: Any = None) -> Any | None:
     """在已启用的星里找陪伴插件，返回它暴露的 ``extension_api``。
 
     接口版本不匹配时直接放弃：宁可这次不协同，也不调用来历不明的同名方法。
+    ``on_reject`` 会在"找到了陪伴插件但用不了"时收到一句原因，便于限流告警。
     """
     getter = getattr(context, "get_all_stars", None)
     if not callable(getter):
         return None
     try:
         result: Any = getter()
-    except Exception:
+    except Exception as exc:
+        if on_reject is not None:
+            on_reject(f"companion star discovery failed: {exc}")
         return None
     if not isinstance(result, (list, tuple)):
         return None
@@ -68,10 +98,15 @@ def find_companion_api(context: Any) -> Any | None:
         if COMPANION_PLUGIN not in names:
             continue
         api = getattr(getattr(star, "star_cls", None), "extension_api", None)
-        if getattr(api, "memory_provider_api_version", None) != SCHEMA:
-            continue
+        version = getattr(api, "memory_provider_api_version", None)
+        if version != SCHEMA:
+            if on_reject is not None:
+                on_reject(f"companion extension_api version is {version!r}, expected {SCHEMA!r}")
+            return None
         if not callable(getattr(api, "register_memory_provider", None)):
-            continue
+            if on_reject is not None:
+                on_reject("companion extension_api has no register_memory_provider")
+            return None
         return api
     return None
 
@@ -141,36 +176,61 @@ def build_record_context(record: Mapping[str, Any]) -> str:
 
 
 class WrittenMemoryIdStore:
-    """``memory_id`` 幂等表：同一条记录重放时不再写第二遍。"""
+    """``bank + memory_id`` 幂等表：同一条记录重放时不再写第二遍。
+
+    条目带写入时间戳：读入时丢掉超过 ``WRITTEN_ID_TTL_SECONDS`` 的，超过
+    ``MAX_WRITTEN_IDS`` 再按最旧淘汰。旧版本存的是纯 ID 列表，读入时按"现在"补时间。
+    """
 
     def __init__(self, data_dir: Path) -> None:
         self.path = data_dir / WRITTEN_IDS_FILE
-        self._ids: list[str] = self._load()
+        self._entries: dict[str, float] = self._load()
 
-    def _load(self) -> list[str]:
+    @staticmethod
+    def key(bank_id: str, memory_id: str) -> str:
+        return f"{bank_id}|{memory_id}"
+
+    def _load(self) -> dict[str, float]:
         try:
             raw = json.loads(self.path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
-            return []
-        if not isinstance(raw, list):
-            return []
-        return [str(item) for item in raw if isinstance(item, str)]
+            return {}
+        now = time.time()
+        entries: dict[str, float] = {}
+        if isinstance(raw, dict):
+            for key, value in raw.items():
+                if not isinstance(key, str):
+                    continue
+                stamp = float(value) if isinstance(value, (int, float)) else now
+                if now - stamp < WRITTEN_ID_TTL_SECONDS:
+                    entries[key] = stamp
+        # 旧版本存的是不带 bank 的纯 ID 列表，无法可靠地映射到某个 bank：直接不迁移。
+        # 代价是升级后那些记录若被重放会多写一次，收益是不会把记录写到错的 bank。
+        return entries
 
-    def contains(self, memory_id: str) -> bool:
-        return memory_id in self._ids
+    def contains(self, bank_id: str, memory_id: str) -> bool:
+        return self.key(bank_id, memory_id) in self._entries
 
-    def add(self, memory_id: str) -> None:
-        self._ids.append(memory_id)
-        if len(self._ids) > MAX_WRITTEN_IDS:
-            self._ids = self._ids[-MAX_WRITTEN_IDS:]
+    def add(self, bank_id: str, memory_id: str) -> None:
+        self._entries[self.key(bank_id, memory_id)] = time.time()
+        if len(self._entries) > MAX_WRITTEN_IDS:
+            keep = sorted(self._entries.items(), key=lambda item: item[1])[-MAX_WRITTEN_IDS:]
+            self._entries = dict(keep)
+        self._flush()
+
+    def _flush(self) -> None:
         tmp = self.path.with_name(f"{self.path.name}.tmp")
         try:
-            tmp.write_text(json.dumps(self._ids, ensure_ascii=False), encoding="utf-8")
+            tmp.write_text(json.dumps(self._entries, ensure_ascii=False), encoding="utf-8")
             tmp.replace(self.path)
-        except OSError as exc:  # 幂等表写不进去不该影响记忆写入
+        except OSError as exc:
+            # 幂等表写不进去不该让已经成功的写入变成失败（否则宿主那边就是一次失败）。
             _log_warning(f"written-id store could not be saved: {exc}")
-            if tmp.exists():
-                tmp.unlink()
+            try:
+                if tmp.exists():
+                    tmp.unlink()
+            except OSError as cleanup_exc:
+                _log_warning(f"written-id temp file could not be removed: {cleanup_exc}")
 
 
 class CompanionMemoryBridge:
@@ -180,25 +240,55 @@ class CompanionMemoryBridge:
         self.plugin = plugin
         self._api: Any | None = None
         self._registration: Any | None = None
-        self._failure_logged = False
+        self._warned_at = 0.0
+        self._write_locks: dict[str, asyncio.Lock] = {}
+        self._inflight = 0
+        self._idle = asyncio.Event()
+        self._idle.set()
         data_dir = getattr(getattr(plugin, "store", None), "data_dir", None)
         self._written = WrittenMemoryIdStore(Path(data_dir)) if data_dir is not None else None
 
-    # ---- 注册生命周期 ----
+    # ---- 配置 ----
 
-    def config_enabled(self) -> bool:
-        """配置项 ``companion_provider_enabled``；缺省视为开启。"""
+    def _cfg_bool(self, key: str, default: bool) -> bool:
         config = getattr(self.plugin, "config", None)
         if config is None:
+            return default
+        try:
+            return _bool_config(config, key, default)
+        except Exception:
+            return default
+
+    def config_enabled(self) -> bool:
+        """「接入陪伴插件」开关；默认关闭——升级不会改变已有安装的行为。"""
+        return self._cfg_bool(CONFIG_KEY, False)
+
+    def personal_allowed(self) -> bool:
+        """是否允许把含个人信息（邮箱/手机号/身份证/地址）的记录写进 Hindsight。"""
+        return self._cfg_bool(PERSONAL_KEY, False)
+
+    def _warn(self, message: str) -> None:
+        """限流告警：同一小时内只留一条，避免每轮刷屏。"""
+        now = time.time()
+        if now - self._warned_at < WARN_INTERVAL_SECONDS:
+            return
+        self._warned_at = now
+        _log_warning(message)
+
+    # ---- 注册生命周期 ----
+
+    def _plugin_enabled(self) -> bool:
+        checker = getattr(self.plugin, "_base_enabled", None)
+        if not callable(checker):
             return True
         try:
-            return bool(config.get(CONFIG_KEY, True))
+            return bool(checker())
         except Exception:
-            return True
+            return False
 
     def is_active(self) -> bool:
         """陪伴插件每次调用前都会问一次；这里把「插件开着且配置完整」如实反映出去。"""
-        if not self.config_enabled():
+        if not self.config_enabled() or not self._plugin_enabled():
             return False
         for name in ("_base_enabled", "_config_complete"):
             checker = getattr(self.plugin, name, None)
@@ -215,16 +305,30 @@ class CompanionMemoryBridge:
     def registered(self) -> bool:
         return self._api is not None and self._registration is not None
 
+    def _callback_timeout(self) -> float:
+        """回调超时跟着插件自己的请求超时走，避免宿主先于 Hindsight 放弃。"""
+        request_timeout = 8.0
+        config = getattr(self.plugin, "config", None)
+        if config is not None:
+            try:
+                request_timeout = float(config.get("request_timeout_seconds", 8.0) or 8.0)
+            except (TypeError, ValueError):
+                request_timeout = 8.0
+        return max(MIN_WRITE_TIMEOUT_SECONDS, request_timeout + TIMEOUT_MARGIN_SECONDS)
+
     async def ensure_registered(self) -> bool:
         """幂等地注册。陪伴插件不在、未启用或接口版本不符时什么都不做。"""
-        if not self.config_enabled():
+        if not self.config_enabled() or not self._plugin_enabled():
             if self.registered:
                 await self.disconnect()
             return False
-        if self.registered:
-            return True
         context = getattr(self.plugin, "_context", None)
-        api = find_companion_api(context)
+        api = find_companion_api(context, on_reject=self._warn)
+        if self.registered:
+            if api is self._api:
+                return True
+            # 陪伴插件重载后是一个新的 extension_api：旧注册不会跟过来，必须重新注册。
+            await self.disconnect()
         if api is None:
             return False
         try:
@@ -238,37 +342,74 @@ class CompanionMemoryBridge:
                 # 与接口示例一致用默认优先级 0；若同时装了「我会牢牢记住你」，
                 # 两个 provider 会被按 provider_id 排序取第一个，建议只保留一个。
                 priority=0,
-                timeout_seconds=WRITE_TIMEOUT_SECONDS,
+                timeout_seconds=self._callback_timeout(),
             )
         except Exception as exc:
-            if not self._failure_logged:
-                _log_warning(f"memory provider registration failed: {exc}")
-                self._failure_logged = True
+            self._warn(f"memory provider registration failed: {exc}")
             return False
         self._api, self._registration = api, registration
-        self._failure_logged = False
         return True
 
     async def disconnect(self) -> None:
+        """注销注册；失败时保留引用，下一次还会重试。"""
         api, registration = self._api, self._registration
-        self._api = self._registration = None
         if api is None or registration is None:
             return
+        await self._wait_idle(5.0)
         unregister = getattr(api, "unregister_memory_provider", None)
-        if not callable(unregister):
+        if callable(unregister):
+            try:
+                unregister(registration)
+            except Exception as exc:
+                # 保留引用：注册表可能还挂着这条记录，下一次 ensure_registered 会再试。
+                self._warn(f"memory provider unregister failed: {exc}")
+                return
+        self._api = self._registration = None
+
+    # ---- 并发与在途写入 ----
+
+    def _lock_for(self, key: str) -> asyncio.Lock:
+        lock = self._write_locks.get(key)
+        if lock is None:
+            if len(self._write_locks) > MAX_WRITE_LOCKS:
+                self._write_locks.clear()
+            lock = asyncio.Lock()
+            self._write_locks[key] = lock
+        return lock
+
+    def _begin_write(self) -> None:
+        self._inflight += 1
+        self._idle.clear()
+
+    def _end_write(self) -> None:
+        self._inflight = max(0, self._inflight - 1)
+        if self._inflight == 0:
+            self._idle.set()
+
+    async def _wait_idle(self, timeout: float) -> None:
+        if self._inflight == 0:
             return
         try:
-            unregister(registration)
-        except Exception as exc:
-            _log_warning(f"memory provider unregister failed: {exc}")
+            await asyncio.wait_for(self._idle.wait(), timeout=timeout)
+        except asyncio.TimeoutError:
+            self._warn(f"shutdown wait for {self._inflight} in-flight write(s) timed out")
 
     # ---- 写入 ----
+
+    def _reject_reason(self, content: str) -> str:
+        """复用抓取/保存路径的同一套判定：硬凭据一律不写，个人信息默认不写。"""
+        if _has_hard_sensitive_secret(content):
+            return "hard_sensitive"
+        if not self.personal_allowed() and _has_personal_sensitive(content):
+            return "personal_sensitive"
+        return ""
 
     async def write(self, record: Any) -> str | None:
         """接收陪伴插件的日记、梦境与主动消息，写入 Hindsight。
 
         返回记录里的 ``memory_id`` 表示已接受；返回 ``None`` 表示拒收（未知类型、
-        无法归属、插件未启用或客户端失败）。宿主不会重试，原始记录仍在它自己库里。
+        无法归属、含敏感内容、插件未启用或客户端失败）。宿主不会重试，原始记录仍在
+        它自己库里。
         """
         if not isinstance(record, Mapping):
             return None
@@ -285,25 +426,36 @@ class CompanionMemoryBridge:
             return None
         if not self.is_active():
             return None
-        if self._written is not None and self._written.contains(memory_id):
-            return memory_id
-
-        salt = str(getattr(self.plugin, "salt", "") or "")
-        timestamp = record.get("occurred_at")
-        try:
-            client = await self.plugin._client()
-            await client.retain(
-                bank_id=self.plugin._bank_id(),
-                content=content.strip(),
-                tags=build_record_tags(salt, record),
-                metadata=build_record_metadata(record),
-                context=build_record_context(record),
-                timestamp=str(timestamp) if isinstance(timestamp, str) and timestamp else None,
-            )
-        except Exception as exc:
-            _log_warning(f"companion record write failed: {exc}")
+        reason = self._reject_reason(content)
+        if reason:
+            self._warn(f"companion record rejected ({reason})")
             return None
 
-        if self._written is not None:
-            self._written.add(memory_id)
-        return memory_id
+        bank_id = str(self.plugin._bank_id())
+        lock = self._lock_for(WrittenMemoryIdStore.key(bank_id, memory_id))
+        async with lock:
+            if self._written is not None and self._written.contains(bank_id, memory_id):
+                return memory_id
+
+            salt = str(getattr(self.plugin, "salt", "") or "")
+            timestamp = record.get("occurred_at")
+            self._begin_write()
+            try:
+                client = await self.plugin._client()
+                await client.retain(
+                    bank_id=bank_id,
+                    content=content.strip(),
+                    tags=build_record_tags(salt, record),
+                    metadata=build_record_metadata(record),
+                    context=build_record_context(record),
+                    timestamp=str(timestamp) if isinstance(timestamp, str) and timestamp else None,
+                )
+            except Exception as exc:
+                _log_warning(f"companion record write failed: {exc}")
+                return None
+            finally:
+                self._end_write()
+
+            if self._written is not None:
+                self._written.add(bank_id, memory_id)
+            return memory_id

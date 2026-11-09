@@ -8,8 +8,14 @@
   "companion_provider_enabled": {
     "description": "接入陪伴插件（private_companion）",
     "type": "bool",
-    "default": true,
-    "hint": "开启后向 astrbot_plugin_private_companion 7.0.7+ 注册为外部记忆 Provider：由本插件承接模型侧记忆，并接收它产生的日记、梦境与主动消息。没装陪伴插件时此项无效果；同时装了「我会牢牢记住你」时，两个插件都想承接同一份记忆，建议只保留一个。"
+    "default": false,
+    "hint": "开启后向 astrbot_plugin_private_companion 7.0.7+ 注册为外部记忆 Provider：由本插件承接模型侧记忆，并接收它产生的日记、梦境与主动消息。默认关闭，需要你主动打开；没装陪伴插件时此项无效果。同时装了「我会牢牢记住你」时，两个插件都想承接同一份记忆，建议只保留一个。"
+  },
+  "companion_retain_personal_sensitive": {
+    "description": "允许保存含个人信息的角色记录",
+    "type": "bool",
+    "default": false,
+    "hint": "陪伴插件的日记、梦境和主动消息里如果出现邮箱、手机号、身份证号或地址，默认不写入 Hindsight；打开后才保存。密码、API Key、私钥这类硬凭据无论此项如何都不会写入。"
   },
   "api_base": {
     "description": "Hindsight 服务地址",

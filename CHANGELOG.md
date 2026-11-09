@@ -5,7 +5,13 @@
 ### 新增
 
 - 支持陪伴插件（`astrbot_plugin_private_companion` 7.0.7+）的外部记忆 Provider 接口（`companion.external-memory.v1`）：注册后由本插件承接模型侧记忆，陪伴插件主动让位；同时接收它产生的日记、梦境与主动消息，按 `memory_id` 幂等写入。
-- 新增配置「接入陪伴插件」（`companion_provider_enabled`，默认开启）。没装陪伴插件时此项无效果。
+- 新增配置「接入陪伴插件」（`companion_provider_enabled`，默认关闭）。没装陪伴插件时此项无效果。
+- 新增配置「允许保存含个人信息的角色记录」（`companion_retain_personal_sensitive`，默认关闭）。硬凭据（密码、API Key、私钥）无论开关如何都不写入。
+
+### 说明
+
+- 写入前的敏感判定复用对话保存路径的同一套规则；按 `bank + memory_id` 记账，换 bank 后会重新写入新目的地。
+- 并发写同一条记录时串行化，避免重复；关闭时等待在途写入完成再注销。
 
 ## v0.1.5（2026-10-26）
 
