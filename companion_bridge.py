@@ -49,6 +49,9 @@ COMPANION_PLUGIN = "astrbot_plugin_private_companion"
 PROVIDER_ID = "astrbot_plugin_hindsight_memory"
 DISPLAY_NAME = "Hindsight Memory"
 WRITTEN_IDS_FILE = "companion_written_ids.json"
+PENDING_FILE = "companion_pending_records.json"
+MAX_PENDING_RECORDS = 50
+PENDING_TTL_SECONDS = 24 * 3600
 ACCEPTED_KINDS = ("persona_life", "proactive_message")
 CONFIG_KEY = "companion_provider_enabled"
 PERSONAL_KEY = "companion_retain_personal_sensitive"
@@ -176,47 +179,72 @@ def build_record_context(record: Mapping[str, Any]) -> str:
 
 
 class WrittenMemoryIdStore:
-    """``bank + memory_id`` 幂等表：同一条记录重放时不再写第二遍。
+    """``bank + memory_id`` 两阶段账本：先占位，写入成功才落 ``done``。
+
+    这样处理崩溃窗口：Hindsight 已接收但账本没来得及记 ``done`` 时，文件里会留下一条
+    ``pending``。重放看到 ``pending`` 就跳过——宁可少一条（原件仍在陪伴插件自己的库里，
+    可以人工补），也不要同一篇日记在记忆里出现两次。
 
     条目带写入时间戳：读入时丢掉超过 ``WRITTEN_ID_TTL_SECONDS`` 的，超过
-    ``MAX_WRITTEN_IDS`` 再按最旧淘汰。旧版本存的是纯 ID 列表，读入时按"现在"补时间。
+    ``MAX_WRITTEN_IDS`` 再按最旧淘汰。
     """
 
     def __init__(self, data_dir: Path) -> None:
         self.path = data_dir / WRITTEN_IDS_FILE
-        self._entries: dict[str, float] = self._load()
+        self._entries: dict[str, dict[str, Any]] = self._load()
 
     @staticmethod
     def key(bank_id: str, memory_id: str) -> str:
         return f"{bank_id}|{memory_id}"
 
-    def _load(self) -> dict[str, float]:
+    def _load(self) -> dict[str, dict[str, Any]]:
         try:
             raw = json.loads(self.path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
             return {}
         now = time.time()
-        entries: dict[str, float] = {}
+        entries: dict[str, dict[str, Any]] = {}
         if isinstance(raw, dict):
             for key, value in raw.items():
                 if not isinstance(key, str):
                     continue
-                stamp = float(value) if isinstance(value, (int, float)) else now
+                if isinstance(value, dict):
+                    state = str(value.get("state") or "done")
+                    stamp = float(value.get("ts") or now)
+                else:
+                    # 上一版存的是 key -> 时间戳，统一按已完成处理
+                    state, stamp = "done", float(value) if isinstance(value, (int, float)) else now
                 if now - stamp < WRITTEN_ID_TTL_SECONDS:
-                    entries[key] = stamp
-        # 旧版本存的是不带 bank 的纯 ID 列表，无法可靠地映射到某个 bank：直接不迁移。
-        # 代价是升级后那些记录若被重放会多写一次，收益是不会把记录写到错的 bank。
+                    entries[key] = {"state": state, "ts": stamp}
+        # 更早的版本存的是不带 bank 的纯 ID 列表，无法映射到具体 bank：不迁移。
         return entries
 
     def contains(self, bank_id: str, memory_id: str) -> bool:
         return self.key(bank_id, memory_id) in self._entries
 
-    def add(self, bank_id: str, memory_id: str) -> None:
-        self._entries[self.key(bank_id, memory_id)] = time.time()
-        if len(self._entries) > MAX_WRITTEN_IDS:
-            keep = sorted(self._entries.items(), key=lambda item: item[1])[-MAX_WRITTEN_IDS:]
-            self._entries = dict(keep)
+    def begin(self, bank_id: str, memory_id: str) -> bool:
+        """占位。返回 False 表示这条记录已经写过或正在写，调用方应当跳过。"""
+        key = self.key(bank_id, memory_id)
+        if key in self._entries:
+            return False
+        self._entries[key] = {"state": "pending", "ts": time.time()}
         self._flush()
+        return True
+
+    def commit(self, bank_id: str, memory_id: str) -> None:
+        self._entries[self.key(bank_id, memory_id)] = {"state": "done", "ts": time.time()}
+        self._trim()
+        self._flush()
+
+    def abort(self, bank_id: str, memory_id: str) -> None:
+        """写入失败：撤掉占位，允许下一次重试。"""
+        if self._entries.pop(self.key(bank_id, memory_id), None) is not None:
+            self._flush()
+
+    def _trim(self) -> None:
+        if len(self._entries) > MAX_WRITTEN_IDS:
+            keep = sorted(self._entries.items(), key=lambda item: item[1].get("ts", 0))[-MAX_WRITTEN_IDS:]
+            self._entries = dict(keep)
 
     def _flush(self) -> None:
         tmp = self.path.with_name(f"{self.path.name}.tmp")
@@ -224,13 +252,59 @@ class WrittenMemoryIdStore:
             tmp.write_text(json.dumps(self._entries, ensure_ascii=False), encoding="utf-8")
             tmp.replace(self.path)
         except OSError as exc:
-            # 幂等表写不进去不该让已经成功的写入变成失败（否则宿主那边就是一次失败）。
+            # 账本写不进去不该让已经成功的写入变成失败（否则宿主那边就是一次失败）。
             _log_warning(f"written-id store could not be saved: {exc}")
             try:
                 if tmp.exists():
                     tmp.unlink()
             except OSError as cleanup_exc:
                 _log_warning(f"written-id temp file could not be removed: {cleanup_exc}")
+
+
+class PendingRecordStore:
+    """写失败的记录在这里短期排队，下一次成功写入时顺带补写。
+
+    接口契约要求 host 不重试，但这条旁路的失败没必要直接丢：留下的是一份精简副本，
+    上限 ``MAX_PENDING_RECORDS`` 条、超过 ``PENDING_TTL_SECONDS`` 丢弃，避免无限堆积。
+    """
+
+    def __init__(self, data_dir: Path) -> None:
+        self.path = data_dir / PENDING_FILE
+
+    def add(self, record: Mapping[str, Any]) -> None:
+        items = self._load()
+        items.append({"ts": time.time(), "record": dict(record)})
+        if len(items) > MAX_PENDING_RECORDS:
+            items = items[-MAX_PENDING_RECORDS:]
+        self._save(items)
+
+    def drain(self) -> list[dict[str, Any]]:
+        """取出可以重试的记录并清空文件（重试失败的会重新入队）。"""
+        items = self._load()
+        self._save([])
+        now = time.time()
+        return [item["record"] for item in items
+                if isinstance(item.get("record"), dict) and now - float(item.get("ts") or now) < PENDING_TTL_SECONDS]
+
+    def _load(self) -> list[dict[str, Any]]:
+        try:
+            raw = json.loads(self.path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return []
+        return [item for item in raw if isinstance(item, dict)] if isinstance(raw, list) else []
+
+    def _save(self, items: list[dict[str, Any]]) -> None:
+        tmp = self.path.with_name(f"{self.path.name}.tmp")
+        try:
+            tmp.write_text(json.dumps(items, ensure_ascii=False), encoding="utf-8")
+            tmp.replace(self.path)
+        except OSError as exc:
+            _log_warning(f"pending record store could not be saved: {exc}")
+            try:
+                if tmp.exists():
+                    tmp.unlink()
+            except OSError as cleanup_exc:
+                _log_warning(f"pending temp file could not be removed: {cleanup_exc}")
 
 
 class CompanionMemoryBridge:
@@ -247,6 +321,8 @@ class CompanionMemoryBridge:
         self._idle.set()
         data_dir = getattr(getattr(plugin, "store", None), "data_dir", None)
         self._written = WrittenMemoryIdStore(Path(data_dir)) if data_dir is not None else None
+        self._pending = PendingRecordStore(Path(data_dir)) if data_dir is not None else None
+        self._flushing = False
 
     # ---- 配置 ----
 
@@ -433,29 +509,58 @@ class CompanionMemoryBridge:
 
         bank_id = str(self.plugin._bank_id())
         lock = self._lock_for(WrittenMemoryIdStore.key(bank_id, memory_id))
+        accepted = False
         async with lock:
-            if self._written is not None and self._written.contains(bank_id, memory_id):
-                return memory_id
+            if self._written is not None and not self._written.begin(bank_id, memory_id):
+                # 已经写过，或者上次写到一半（崩溃前的 pending）：跳过，不重复写
+                accepted = True
+            else:
+                salt = str(getattr(self.plugin, "salt", "") or "")
+                timestamp = record.get("occurred_at")
+                written = False
+                self._begin_write()
+                try:
+                    client = await self.plugin._client()
+                    await client.retain(
+                        bank_id=bank_id,
+                        content=content.strip(),
+                        tags=build_record_tags(salt, record),
+                        metadata=build_record_metadata(record),
+                        context=build_record_context(record),
+                        timestamp=str(timestamp) if isinstance(timestamp, str) and timestamp else None,
+                    )
+                    written = True
+                except Exception as exc:
+                    _log_warning(f"companion record write failed: {exc}")
+                finally:
+                    self._end_write()
 
-            salt = str(getattr(self.plugin, "salt", "") or "")
-            timestamp = record.get("occurred_at")
-            self._begin_write()
-            try:
-                client = await self.plugin._client()
-                await client.retain(
-                    bank_id=bank_id,
-                    content=content.strip(),
-                    tags=build_record_tags(salt, record),
-                    metadata=build_record_metadata(record),
-                    context=build_record_context(record),
-                    timestamp=str(timestamp) if isinstance(timestamp, str) and timestamp else None,
-                )
-            except Exception as exc:
-                _log_warning(f"companion record write failed: {exc}")
-                return None
-            finally:
-                self._end_write()
+                if written:
+                    if self._written is not None:
+                        self._written.commit(bank_id, memory_id)
+                    accepted = True
+                else:
+                    if self._written is not None:
+                        self._written.abort(bank_id, memory_id)
+                    if self._pending is not None:
+                        self._pending.add(record)
 
-            if self._written is not None:
-                self._written.add(bank_id, memory_id)
+        # 补写在锁外进行：同一 memory_id 的重试要重新拿这把锁，持锁调用会自己等自己
+        if accepted:
+            await self._flush_pending()
             return memory_id
+        return None
+
+    async def _flush_pending(self) -> None:
+        """补写之前失败的记录；一次只跑一层，避免和正常写入互相递归。"""
+        if self._pending is None or self._flushing:
+            return
+        records = self._pending.drain()
+        if not records:
+            return
+        self._flushing = True
+        try:
+            for record in records:
+                await self.write(record)
+        finally:
+            self._flushing = False

@@ -350,9 +350,31 @@ class BridgeWriteTests(unittest.IsolatedAsyncioTestCase):
         bridge = self._bridge()
         bridge.plugin.client.fail = True
         self.assertIsNone(await bridge.write(record()))
-        # 失败不记账，下一次仍然会尝试
+        # 失败不记入账本，下一次仍然会尝试
         bridge.plugin.client.fail = False
         self.assertEqual(await bridge.write(record()), "mem-1")
+
+    async def test_failed_write_is_queued_and_retried_on_next_success(self):
+        bridge = self._bridge()
+        bridge.plugin.client.fail = True
+        self.assertIsNone(await bridge.write(record(memory_id="mem-a")))
+        self.assertEqual(bridge.plugin.client.retained, [])
+
+        bridge.plugin.client.fail = False
+        self.assertEqual(await bridge.write(record(memory_id="mem-b")), "mem-b")
+        # mem-a 在同一次调用里被顺带补写（当前这条先写，补写跟在后面）
+        self.assertEqual(len(bridge.plugin.client.retained), 2)
+        written_ids = [call["metadata"]["memory_id"] for call in bridge.plugin.client.retained]
+        self.assertEqual(written_ids, ["mem-b", "mem-a"])
+
+    async def test_crash_leftover_blocks_replay(self):
+        # 模拟"写完一条、账本还停在 pending 就崩了"：重放必须跳过，不能写第二遍
+        store = WrittenMemoryIdStore(self.data_dir)
+        store.begin("bank-1", "mem-c")
+
+        bridge = self._bridge()
+        self.assertEqual(await bridge.write(record(memory_id="mem-c")), "mem-c")
+        self.assertEqual(bridge.plugin.client.retained, [])
 
 
 class ShutdownTests(unittest.IsolatedAsyncioTestCase):
@@ -391,9 +413,25 @@ class WrittenMemoryIdStoreTests(unittest.TestCase):
     def test_round_trip_and_bank_isolation(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = WrittenMemoryIdStore(Path(tmp))
-            store.add("bank-1", "a")
-            self.assertTrue(WrittenMemoryIdStore(Path(tmp)).contains("bank-1", "a"))
-            self.assertFalse(WrittenMemoryIdStore(Path(tmp)).contains("bank-2", "a"))
+            self.assertTrue(store.begin("bank-1", "a"))
+            store.commit("bank-1", "a")
+            reloaded = WrittenMemoryIdStore(Path(tmp))
+            self.assertTrue(reloaded.contains("bank-1", "a"))
+            self.assertFalse(reloaded.contains("bank-2", "a"))
+
+    def test_begin_twice_returns_false(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = WrittenMemoryIdStore(Path(tmp))
+            self.assertTrue(store.begin("bank-1", "a"))
+            # 第一次没提交就再来一次：说明上次可能已经写过，必须跳过
+            self.assertFalse(store.begin("bank-1", "a"))
+
+    def test_abort_allows_retry(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = WrittenMemoryIdStore(Path(tmp))
+            store.begin("bank-1", "a")
+            store.abort("bank-1", "a")
+            self.assertTrue(store.begin("bank-1", "a"))
 
     def test_legacy_list_format_is_not_migrated(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -404,13 +442,20 @@ class WrittenMemoryIdStoreTests(unittest.TestCase):
             self.assertFalse(store.contains("bank-1", "legacy-1"))
 
     def test_cap_evicts_oldest(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            store = WrittenMemoryIdStore(Path(tmp))
-            for index in range(5100):
-                store.add("bank-1", f"id-{index}")
-            reloaded = WrittenMemoryIdStore(Path(tmp))
-            self.assertTrue(reloaded.contains("bank-1", "id-5099"))
-            self.assertFalse(reloaded.contains("bank-1", "id-0"))
+        import astrbot_plugin_hindsight_memory.companion_bridge as cb
+        original = cb.MAX_WRITTEN_IDS
+        cb.MAX_WRITTEN_IDS = 20
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                store = WrittenMemoryIdStore(Path(tmp))
+                for index in range(25):
+                    store.begin("bank-1", f"id-{index}")
+                    store.commit("bank-1", f"id-{index}")
+                reloaded = WrittenMemoryIdStore(Path(tmp))
+                self.assertTrue(reloaded.contains("bank-1", "id-24"))
+                self.assertFalse(reloaded.contains("bank-1", "id-0"))
+        finally:
+            cb.MAX_WRITTEN_IDS = original
 
 
 if __name__ == "__main__":
